@@ -1,28 +1,72 @@
-#! /usr/bin/env python
+#! /usr/bin/env python3
 import os
 import subprocess
 import sys
+import time
+import signal
 from pathlib import Path
 
 DOWNWARD_DIR = Path(__file__).resolve().parent
 
+def run(*args, **kwargs):
+    input = kwargs.pop("input", None)
+    output = kwargs.pop("output", None)
+    assert not kwargs
+    redirections = {}
+    if input:
+        redirections["stdin"] = open(input)
+    if output:
+        redirections["stdout"] = open(output, "w")
+    print(args, redirections)
+    subprocess.check_call(sum([arg.split("+") for arg in args],[]), **redirections)
+
 def main(domain, problem, result_name, config, keep_files: bool = False):
-    def run(*args, **kwargs):
-        input = kwargs.pop("input", None)
-        output = kwargs.pop("output", None)
-        assert not kwargs
-        redirections = {}
-        if input:
-            redirections["stdin"] = open(input)
-        if output:
-            redirections["stdout"] = open(output, "w")
-        print(args, redirections)
-        subprocess.check_call(sum([arg.split("+") for arg in args],[]), **redirections)
 
     os.chdir(DOWNWARD_DIR)
     run("translate/translate.py", domain, problem)
     run("preprocess/preprocess", input="output.sas")
-    run("search/search", config, "p", result_name, input="output")
+
+    # blocks the execution and does not allow our plugin to read the solution file
+    # run("search/search", config, "p", result_name, input="output")
+
+    # the output goes to null and the plan is captured with the array 'final_plan_lines'
+    search_args = ["search/search"] + config.split("+") + ["p", "/dev/null"]
+    final_plan_lines = []
+
+    with open("output", "r") as search_in:
+        # Non-blocking execution
+        process = subprocess.Popen(
+            search_args,
+            stdin=search_in,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            preexec_fn=os.setsid 
+        )
+
+        # iterates over all the output from the command
+        for line in process.stdout:
+            clean_line = line.strip()
+            
+            # If there's an optimized plan: 
+            # clean the file with the previous info and start writing
+            # the optimized one.
+            if "Rescheduled Plan" in clean_line:
+                final_plan_lines = []
+                continue
+
+            # Looks for an action line in the plan:
+            if ":" in clean_line and "(" in clean_line and "[" in clean_line:
+                try:
+                    time_val = float(clean_line.split(":")[0])
+                    final_plan_lines.append((time_val, clean_line))
+                except ValueError:
+                    continue
+
+            # End up with the 1st plan solution file
+            if final_plan_lines and ("Solution with" in clean_line or "Plan length" in clean_line):
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)  # kills the process
+                break
 
     output_dir = Path(result_name).parent
     for fname in ["all.groups", "output", "output.sas", "variables.groups"]:
@@ -32,6 +76,16 @@ def main(domain, problem, result_name, config, keep_files: bool = False):
         else:
             file.unlink()
 
+    # If a plan has been found: keep it in the solutionFile
+    if final_plan_lines:
+        final_plan_lines.sort()
+        with open(str(result_name), "w") as f:
+            for _, content in final_plan_lines:
+                f.write(f"{content}\n")
+        print(f"\nPlan succesfully generated in: {result_name}")
+    else:
+        print("\nSolution not found.")
+
 if __name__ == "__main__":
     if len(sys.argv) < 4:
         print("Usage: tfd <domainFile> <problemFile> <solutionFile> [config]")
@@ -40,5 +94,5 @@ if __name__ == "__main__":
         domain = str(Path(domain).resolve())
         problem = str(Path(problem).resolve())
         result_name = str(Path(result_name).resolve())
-        config = sys.argv[4] if len(sys.argv) == 5 else "y+Y+a+e+r+O+1+C+1+b"
+        config = sys.argv[4] if len(sys.argv) == 5 else "y+Y+a+e+r+O+1+C+1+b" # "n+Y+a+e+r+O+0+C+1+b"
         main(domain, problem, result_name, config)
